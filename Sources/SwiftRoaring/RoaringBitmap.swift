@@ -22,8 +22,9 @@ public typealias RoaringStatistics = roaring_statistics_t
 public final class RoaringBitmap: Sequence, Equatable, CustomStringConvertible,
                                   Hashable, ExpressibleByArrayLiteral, SetAlgebra, Codable {
 
+    // `let`, so `deinit` reads them without dynamic exclusivity checks.
     @usableFromInline
-    var ptr: UnsafeMutablePointer<roaring_bitmap_t>
+    let ptr: UnsafeMutablePointer<roaring_bitmap_t>
 
     ///
     /// When this bitmap is a *frozen view* created by `frozenView(bytes:)`, this
@@ -31,7 +32,7 @@ public final class RoaringBitmap: Sequence, Equatable, CustomStringConvertible,
     /// bitmap itself, by `deinit`. It is `nil` for every ordinary bitmap.
     ///
     @usableFromInline
-    var frozenBacking: UnsafeMutableRawPointer?
+    let frozenBacking: UnsafeMutableRawPointer?
 
     public typealias Element = UInt32
 
@@ -41,8 +42,8 @@ public final class RoaringBitmap: Sequence, Equatable, CustomStringConvertible,
     ///
     /// Creates a new bitmap (initially empty)
     ///
-    required public init() {
-        self.ptr = croaring.roaring_bitmap_create()!
+    required public convenience init() {
+        self.init(ptr: croaring.roaring_bitmap_create()!)
     }
 
     ///
@@ -50,43 +51,48 @@ public final class RoaringBitmap: Sequence, Equatable, CustomStringConvertible,
     ///
     required public init(ptr: UnsafeMutablePointer<roaring_bitmap_t>) {
         self.ptr = ptr
+        self.frozenBacking = nil
+    }
+
+    private init(ptr: UnsafeMutablePointer<roaring_bitmap_t>, frozenBacking: UnsafeMutableRawPointer) {
+        self.ptr = ptr
+        self.frozenBacking = frozenBacking
     }
 
     ///
     /// Add all the values between min (included) and max (excluded) that are at a
     /// distance k*step from min.
     ///
-    public init(min: UInt64, max: UInt64, step: UInt32) {
-        self.ptr = croaring.roaring_bitmap_from_range(min, max, step)!
+    public convenience init(min: UInt64, max: UInt64, step: UInt32) {
+        self.init(ptr: croaring.roaring_bitmap_from_range(min, max, step)!)
     }
 
-    public init(range: Range<UInt64>, step: UInt32) {
-        self.ptr = croaring.roaring_bitmap_from_range(
+    public convenience init(range: Range<UInt64>, step: UInt32) {
+        self.init(ptr: croaring.roaring_bitmap_from_range(
             range.lowerBound,
             range.upperBound,
             step
-        )!
+        )!)
     }
 
     ///
     /// Creates a new bitmap (initially empty) with a provided
     /// container-storage capacity (it is a performance hint).
     ///
-    public init(capacity: UInt32) {
-        self.ptr = croaring.roaring_bitmap_create_with_capacity(capacity)!
+    public convenience init(capacity: UInt32) {
+        self.init(ptr: croaring.roaring_bitmap_create_with_capacity(capacity)!)
     }
 
     ///
     /// Creates a new bitmap from a pointer of `uint32_t` integers
     ///
-    public init(values: [UInt32]) {
-        self.ptr = croaring.roaring_bitmap_of_ptr(values.count, values)!
+    public convenience init(values: [UInt32]) {
+        self.init(ptr: croaring.roaring_bitmap_of_ptr(values.count, values)!)
     }
 
-    public required init(arrayLiteral: Element...) {
-        self.ptr = croaring.roaring_bitmap_create()!
+    public required convenience init(arrayLiteral: Element...) {
+        self.init(ptr: croaring.roaring_bitmap_create()!)
         for i in arrayLiteral { add(i) }
-
     }
 
     deinit {
@@ -782,14 +788,14 @@ public final class RoaringBitmap: Sequence, Equatable, CustomStringConvertible,
     ///
     /// Encodable conformance
     ///
-    public func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: any Encoder) throws {
         var container = encoder.singleValueContainer()
         let count = self.sizeInBytes()
         var data = Data(count: count)
 
-        data.withUnsafeMutableBytes {
-            let ptr = $0.baseAddress!.assumingMemoryBound(to: Int8.self)
-            croaring.roaring_bitmap_serialize(self.ptr, ptr)
+        data.withUnsafeMutableBytes { (buffer: UnsafeMutableRawBufferPointer) in
+            let ptr = buffer.baseAddress!.assumingMemoryBound(to: Int8.self)
+            _ = croaring.roaring_bitmap_serialize(self.ptr, ptr)
         }
         try container.encode(data.base64EncodedString())
     }
@@ -797,14 +803,21 @@ public final class RoaringBitmap: Sequence, Equatable, CustomStringConvertible,
     ///
     /// Decodable conformance
     ///
-    public init(from decoder: Decoder) throws {
+    public convenience init(from decoder: any Decoder) throws {
         let container = try decoder.singleValueContainer()
 
         let buffer = try container.decode(String.self)
-        let data = Data(base64Encoded: buffer)
-        self.ptr = data!.withUnsafeBytes {
-            croaring.roaring_bitmap_deserialize($0)!
+        let ptr = Data(base64Encoded: buffer).flatMap { data in
+            data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+                bytes.baseAddress.flatMap {
+                    croaring.roaring_bitmap_deserialize_safe($0, bytes.count)
+                }
+            }
         }
+        guard let ptr = ptr else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "not a serialized bitmap")
+        }
+        self.init(ptr: ptr)
     }
 
     ///
@@ -877,6 +890,17 @@ public final class RoaringBitmap: Sequence, Equatable, CustomStringConvertible,
     @inlinable @inline(__always)
     public func portableSerialize(buffer: inout [Int8]) -> size_t {
         return croaring.roaring_bitmap_portable_serialize(self.ptr, &buffer)
+    }
+
+    ///
+    /// The bitmap in the portable format.
+    ///
+    @inlinable
+    public func portableSerialized() -> [UInt8] {
+        return [UInt8](unsafeUninitializedCapacity: self.portableSizeInBytes()) { buffer, count in
+            count = croaring.roaring_bitmap_portable_serialize(
+                self.ptr, UnsafeMutableRawPointer(buffer.baseAddress!).assumingMemoryBound(to: CChar.self))
+        }
     }
 
     ///
@@ -1624,9 +1648,7 @@ extension RoaringBitmap {
             buffer.deallocate()
             return nil
         }
-        let bitmap = Self(ptr: ptr)
-        bitmap.frozenBacking = buffer
-        return bitmap
+        return Self(ptr: ptr, frozenBacking: buffer)
     }
 }
 
@@ -1649,3 +1671,123 @@ extension RoaringBitmap {
         return reason.map { String(cString: $0) } ?? "unknown reason"
     }
 }
+
+// Spans arrived with the Swift 6.2 compiler; the stdlib back-deploys them to these OS versions.
+#if compiler(>=6.2)
+
+/////////////////////////////////////////////////////////////////////////////
+///                       PORTABLE FORMAT IN PLACE                        ///
+/////////////////////////////////////////////////////////////////////////////
+
+@available(macOS 10.14.4, iOS 12.2, watchOS 5.2, tvOS 12.2, visionOS 1.0, *)
+extension RoaringBitmap {
+    ///
+    /// Reads a bitmap in the portable format from `bytes`, without copying them
+    /// first. Returns nil if `bytes` do not hold a valid bitmap.
+    ///
+    @inlinable
+    public convenience init?(portableBytes bytes: RawSpan) {
+        let ptr = bytes.withUnsafeBytes { bytes in
+            bytes.baseAddress.flatMap {
+                croaring.roaring_bitmap_portable_deserialize_safe($0.assumingMemoryBound(to: CChar.self), bytes.count)
+            }
+        }
+        guard let ptr = ptr else { return nil }
+        self.init(ptr: ptr)
+    }
+
+    ///
+    /// Writes the bitmap in the portable format to the start of `buffer`, which
+    /// must hold at least `portableSizeInBytes()` bytes, and returns the number
+    /// of bytes written.
+    ///
+    @inlinable
+    public func portableSerialize(into buffer: inout MutableRawSpan) -> Int {
+        precondition(buffer.byteCount >= self.portableSizeInBytes(), "buffer smaller than portableSizeInBytes()")
+        return buffer.withUnsafeMutableBytes {
+            croaring.roaring_bitmap_portable_serialize(self.ptr, $0.baseAddress!.assumingMemoryBound(to: CChar.self))
+        }
+    }
+
+    ///
+    /// Calls `body` with a read-only view of the portable bitmap in `bytes`, read
+    /// in place, and returns its result, or nil if `bytes` do not hold exactly one
+    /// valid bitmap.
+    ///
+    @inlinable
+    public static func withPortableView<Result: ~Copyable, Failure: Error>(
+        of bytes: RawSpan,
+        _ body: (borrowing View) throws(Failure) -> Result
+    ) throws(Failure) -> Result? {
+        let ptr = bytes.withUnsafeBytes { bytes -> UnsafeMutablePointer<roaring_bitmap_t>? in
+            guard let base = bytes.baseAddress?.assumingMemoryBound(to: CChar.self),
+                  croaring.roaring_bitmap_portable_deserialize_size(base, bytes.count) == bytes.count else {
+                return nil
+            }
+            return croaring.roaring_bitmap_portable_deserialize_frozen(base)
+        }
+        guard let ptr = ptr else { return nil }
+        defer { croaring.roaring_bitmap_free(ptr) }
+        return try body(View(ptr: ptr))
+    }
+
+    ///
+    /// A read-only bitmap reading serialized bytes in place, lent to the body of
+    /// `withPortableView(of:_:)`. Being noncopyable and borrowed, it cannot
+    /// outlive that call.
+    ///
+    public struct View: ~Copyable {
+        @usableFromInline
+        let ptr: UnsafePointer<roaring_bitmap_t>
+
+        @inlinable
+        init(ptr: UnsafePointer<roaring_bitmap_t>) {
+            self.ptr = ptr
+        }
+
+        @inlinable
+        public var count: UInt64 {
+            return croaring.roaring_bitmap_get_cardinality(self.ptr)
+        }
+
+        @inlinable
+        public var isEmpty: Bool {
+            return croaring.roaring_bitmap_is_empty(self.ptr)
+        }
+
+        @inlinable
+        public func contains(_ value: UInt32) -> Bool {
+            return croaring.roaring_bitmap_contains(self.ptr, value)
+        }
+
+        @inlinable
+        public func min() -> UInt32? {
+            return self.isEmpty ? nil : croaring.roaring_bitmap_minimum(self.ptr)
+        }
+
+        @inlinable
+        public func max() -> UInt32? {
+            return self.isEmpty ? nil : croaring.roaring_bitmap_maximum(self.ptr)
+        }
+
+        /// The number of values smaller than or equal to `value`.
+        @inlinable
+        public func rank(value: UInt32) -> UInt64 {
+            return croaring.roaring_bitmap_rank(self.ptr, value)
+        }
+
+        /// The value of rank `rank`, the smallest having rank 0.
+        @inlinable
+        public func select(rank: UInt32) -> UInt32? {
+            var value: UInt32 = 0
+            return croaring.roaring_bitmap_select(self.ptr, rank, &value) ? value : nil
+        }
+
+        /// A mutable copy, for anything a view does not offer.
+        public func copy() -> RoaringBitmap {
+            return RoaringBitmap(ptr: croaring.roaring_bitmap_copy(self.ptr)!)
+        }
+    }
+}
+
+#endif
