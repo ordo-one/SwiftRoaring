@@ -1698,12 +1698,14 @@ extension RoaringBitmap {
 
     ///
     /// Replaces the contents with the portable bitmap in `bytes`, reusing this
-    /// bitmap's allocations. Returns false, leaving the bitmap unchanged, if
+    /// bitmap's allocations: a container of the same type at the same position
+    /// is copied into, so a bitmap reloaded with similar bytes stops allocating
+    /// for its containers. Returns false, leaving the bitmap unchanged, if
     /// `bytes` do not hold exactly one valid bitmap; also returns false, leaving
     /// it empty, if allocation fails.
     ///
-    @inlinable
     public func overwrite(withPortableBytes bytes: RawSpan) -> Bool {
+        precondition(frozenBacking == nil, "a frozen view is read-only")
         return bytes.withUnsafeBytes { bytes in
             guard let base = bytes.baseAddress?.assumingMemoryBound(to: CChar.self),
                   croaring.roaring_bitmap_portable_deserialize_size(base, bytes.count) == bytes.count,
@@ -1711,8 +1713,54 @@ extension RoaringBitmap {
                 return false
             }
             defer { croaring.roaring_bitmap_free(view) }
-            return croaring.roaring_bitmap_overwrite(self.ptr, view)
+            return Self.overwriteReusingContainers(self.ptr, with: view)
         }
+    }
+
+    // Reaches into croaring's roaring_array_t, which roaring_bitmap_overwrite would free and re-clone container by container.
+    private static func overwriteReusingContainers(_ dest: UnsafeMutablePointer<roaring_bitmap_t>, with source: UnsafePointer<roaring_bitmap_t>) -> Bool {
+        let src = source.pointee.high_low_container
+        let dst = dest.pointee.high_low_container
+        guard dst.allocation_size >= src.size else {
+            return croaring.roaring_bitmap_overwrite(dest, source)
+        }
+        let oldSize = Int(dst.size)
+        for i in 0..<Int(src.size) {
+            let type = src.typecodes[i]
+            let from = src.containers[i]!
+            if i < oldSize, dst.typecodes[i] == type {
+                let to = dst.containers[i]!
+                switch Int32(type) {
+                case ARRAY_CONTAINER_TYPE:
+                    array_container_copy(from.assumingMemoryBound(to: array_container_t.self), to.assumingMemoryBound(to: array_container_t.self))
+                case BITSET_CONTAINER_TYPE:
+                    bitset_container_copy(from.assumingMemoryBound(to: bitset_container_t.self), to.assumingMemoryBound(to: bitset_container_t.self))
+                default:
+                    run_container_copy(from.assumingMemoryBound(to: run_container_t.self), to.assumingMemoryBound(to: run_container_t.self))
+                }
+            } else {
+                if i < oldSize {
+                    container_free(dst.containers[i], dst.typecodes[i])
+                }
+                guard let clone = container_clone(from, type) else {
+                    // Slots before i hold copies, slot i nothing, slots after i the old containers.
+                    for j in (i + 1)..<Swift.max(i + 1, oldSize) {
+                        container_free(dst.containers[j], dst.typecodes[j])
+                    }
+                    dest.pointee.high_low_container.size = Int32(i)
+                    croaring.roaring_bitmap_clear(dest)
+                    return false
+                }
+                dst.containers[i] = clone
+                dst.typecodes[i] = type
+            }
+            dst.keys[i] = src.keys[i]
+        }
+        for i in Int(src.size)..<Swift.max(Int(src.size), oldSize) {
+            container_free(dst.containers[i], dst.typecodes[i])
+        }
+        dest.pointee.high_low_container.size = src.size
+        return true
     }
 
     ///
