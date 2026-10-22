@@ -1697,6 +1697,25 @@ extension RoaringBitmap {
     }
 
     ///
+    /// Replaces the contents with the portable bitmap in `bytes`, reusing this
+    /// bitmap's allocations. Returns false, leaving the bitmap unchanged, if
+    /// `bytes` do not hold exactly one valid bitmap; also returns false, leaving
+    /// it empty, if allocation fails.
+    ///
+    @inlinable
+    public func overwrite(withPortableBytes bytes: RawSpan) -> Bool {
+        return bytes.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress?.assumingMemoryBound(to: CChar.self),
+                  croaring.roaring_bitmap_portable_deserialize_size(base, bytes.count) == bytes.count,
+                  let view = croaring.roaring_bitmap_portable_deserialize_frozen(base) else {
+                return false
+            }
+            defer { croaring.roaring_bitmap_free(view) }
+            return croaring.roaring_bitmap_overwrite(self.ptr, view)
+        }
+    }
+
+    ///
     /// Writes the bitmap in the portable format to the start of `buffer`, which
     /// must hold at least `portableSizeInBytes()` bytes, and returns the number
     /// of bytes written.
